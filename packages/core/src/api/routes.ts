@@ -78,7 +78,7 @@ async function handleTransformerEndpoint(
     );
 
     // Process response transformer chain
-    const finalResponse = await processResponseTransformers(
+    let finalResponse = await processResponseTransformers(
       requestBody,
       response,
       provider,
@@ -88,6 +88,19 @@ async function handleTransformerEndpoint(
         req,
       }
     );
+
+    if (requestedStream) {
+      finalResponse = await maybeRetryEmptyStreamResponse(
+        finalResponse,
+        requestBody,
+        config,
+        provider,
+        fastify,
+        bypass,
+        transformer,
+        req
+      );
+    }
 
     // Format and return response
     return formatResponse(finalResponse, reply, requestedStream, req);
@@ -101,6 +114,186 @@ async function handleTransformerEndpoint(
     }
     throw error;
   }
+}
+
+type StreamCaptureAnalysis = {
+  hasNonEmptyTextDelta: boolean;
+  hasToolUseBlock: boolean;
+  finalStopReason: string | null;
+};
+
+type CapturedStream = {
+  chunks: Uint8Array[];
+  analysis: StreamCaptureAnalysis;
+};
+
+function shouldRetryEmptyStream(analysis: StreamCaptureAnalysis): boolean {
+  return (
+    !analysis.hasNonEmptyTextDelta &&
+    !analysis.hasToolUseBlock &&
+    analysis.finalStopReason === "end_turn"
+  );
+}
+
+function buildRetryBody(requestBody: any): any {
+  const retryBody = JSON.parse(JSON.stringify(requestBody));
+  const retryPrompt = "Previous completion was empty. Continue and provide a concise text response.";
+
+  if (Array.isArray(retryBody?.input)) {
+    retryBody.input.push({
+      role: "user",
+      content: [{ type: "input_text", text: retryPrompt }],
+    });
+    return retryBody;
+  }
+
+  if (Array.isArray(retryBody?.messages)) {
+    retryBody.messages.push({
+      role: "user",
+      content: retryPrompt,
+    });
+  }
+
+  return retryBody;
+}
+
+function createReplayResponse(originalResponse: Response, chunks: Uint8Array[]): Response {
+  const replayBody = new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(chunk);
+      }
+      controller.close();
+    },
+  });
+
+  return new Response(replayBody, {
+    status: originalResponse.status,
+    statusText: originalResponse.statusText,
+    headers: new Headers(originalResponse.headers),
+  });
+}
+
+async function captureSseStream(response: Response): Promise<CapturedStream> {
+  const body = response.body;
+  if (!body) {
+    return {
+      chunks: [],
+      analysis: {
+        hasNonEmptyTextDelta: false,
+        hasToolUseBlock: false,
+        finalStopReason: null,
+      },
+    };
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: Uint8Array[] = [];
+  let textBuffer = "";
+  const analysis: StreamCaptureAnalysis = {
+    hasNonEmptyTextDelta: false,
+    hasToolUseBlock: false,
+    finalStopReason: null,
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+
+    chunks.push(value);
+    textBuffer += decoder.decode(value, { stream: true });
+    const lines = textBuffer.split("\n");
+    textBuffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+
+      if (
+        parsed?.type === "content_block_start" &&
+        parsed?.content_block?.type === "tool_use"
+      ) {
+        analysis.hasToolUseBlock = true;
+      }
+
+      if (
+        parsed?.type === "content_block_delta" &&
+        parsed?.delta?.type === "text_delta" &&
+        typeof parsed?.delta?.text === "string" &&
+        parsed.delta.text.trim().length > 0
+      ) {
+        analysis.hasNonEmptyTextDelta = true;
+      }
+
+      if (parsed?.type === "message_delta" && parsed?.delta?.stop_reason) {
+        analysis.finalStopReason = parsed.delta.stop_reason;
+      }
+    }
+  }
+
+  return { chunks, analysis };
+}
+
+async function maybeRetryEmptyStreamResponse(
+  initialResponse: Response,
+  requestBody: any,
+  config: any,
+  provider: any,
+  fastify: FastifyInstance,
+  bypass: boolean,
+  transformer: any,
+  req: FastifyRequest
+): Promise<Response> {
+  let currentResponse = initialResponse;
+
+  for (let attempt = 0; attempt <= 1; attempt++) {
+    const captured = await captureSseStream(currentResponse);
+
+    if (attempt === 0 && shouldRetryEmptyStream(captured.analysis)) {
+      req.log.warn(
+        {
+          provider: provider?.name,
+          model: requestBody?.model,
+          stopReason: captured.analysis.finalStopReason,
+        },
+        "empty stream response detected, retrying once"
+      );
+
+      const retryBody = buildRetryBody(requestBody);
+      const retryRawResponse = await sendRequestToProvider(
+        retryBody,
+        config,
+        provider,
+        fastify,
+        bypass,
+        transformer,
+        { req }
+      );
+      currentResponse = await processResponseTransformers(
+        retryBody,
+        retryRawResponse,
+        provider,
+        transformer,
+        bypass,
+        { req }
+      );
+      continue;
+    }
+
+    return createReplayResponse(currentResponse, captured.chunks);
+  }
+
+  return currentResponse;
 }
 
 /**
