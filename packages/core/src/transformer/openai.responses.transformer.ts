@@ -83,6 +83,9 @@ export class OpenAIResponsesTransformer implements Transformer {
     });
 
     delete request.temperature;
+    if (typeof request.max_tokens === "number") {
+      (request as any).max_output_tokens = request.max_tokens;
+    }
     delete request.max_tokens;
 
     // 处理 reasoning 参数
