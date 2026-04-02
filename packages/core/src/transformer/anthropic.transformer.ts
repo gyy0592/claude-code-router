@@ -426,7 +426,7 @@ export class AnthropicTransformer implements Transformer {
                       index: emptyTextBlockIndex,
                       delta: {
                         type: "text_delta",
-                        text: "OK",
+                        text: "",
                       },
                     })}\n\n`
                   )
@@ -596,7 +596,20 @@ export class AnthropicTransformer implements Transformer {
                   );
                 }
 
-                const choice = chunk.choices?.[0];
+                const choices = Array.isArray(chunk.choices)
+                  ? chunk.choices
+                  : [];
+                const choice =
+                  choices.find(
+                    (c: any) =>
+                      c?.delta?.content ||
+                      c?.delta?.thinking ||
+                      (Array.isArray(c?.delta?.tool_calls) &&
+                        c.delta.tool_calls.length > 0) ||
+                      (Array.isArray(c?.delta?.annotations) &&
+                        c.delta.annotations.length > 0) ||
+                      c?.finish_reason
+                  ) || choices[0];
                 if (chunk.usage) {
                   if (!stopReasonMessageDelta) {
                     stopReasonMessageDelta = {
