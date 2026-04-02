@@ -314,6 +314,33 @@ export class AnthropicTransformer implements Transformer {
         const safeClose = () => {
           if (!isClosed) {
             try {
+              if (!hasStarted) {
+                hasStarted = true;
+                const messageStart = {
+                  type: "message_start",
+                  message: {
+                    id: messageId,
+                    type: "message",
+                    role: "assistant",
+                    content: [],
+                    model: model,
+                    stop_reason: null,
+                    stop_sequence: null,
+                    usage: {
+                      input_tokens: 0,
+                      output_tokens: 0,
+                    },
+                  },
+                };
+                safeEnqueue(
+                  encoder.encode(
+                    `event: message_start\ndata: ${JSON.stringify(
+                      messageStart
+                    )}\n\n`
+                  )
+                );
+              }
+
               // Close any remaining open content block
               if (currentContentBlockIndex >= 0) {
                 const contentBlockStop = {
