@@ -27,6 +27,43 @@ declare module "fastify" {
 }
 
 /**
+ * In-memory rate limit cache.
+ * Key: "provider,model" (e.g. "or,nvidia/nemotron-3-super-120b-a12b:free")
+ * Value: timestamp (ms) when the rate limit resets. Requests before this time skip the model.
+ */
+const rateLimitCache = new Map<string, number>();
+
+function isRateLimited(providerName: string, model: string): boolean {
+  const key = `${providerName},${model}`;
+  const resetAt = rateLimitCache.get(key);
+  if (!resetAt) return false;
+  if (Date.now() >= resetAt) {
+    rateLimitCache.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markRateLimited(providerName: string, model: string, resetAt?: number): void {
+  const key = `${providerName},${model}`;
+  // Default: block until end of current UTC day if no reset header
+  const fallbackReset = new Date();
+  fallbackReset.setUTCHours(24, 0, 0, 0);
+  rateLimitCache.set(key, resetAt || fallbackReset.getTime());
+}
+
+function parseRateLimitReset(errorText: string): number | undefined {
+  // Try to extract X-RateLimit-Reset from error text (OpenRouter includes it)
+  const match = errorText.match(/X-RateLimit-Reset["\s:]+(\d{10,13})/i);
+  if (match) {
+    const val = parseInt(match[1], 10);
+    // If it's in seconds (10 digits), convert to ms
+    return val < 1e12 ? val * 1000 : val;
+  }
+  return undefined;
+}
+
+/**
  * Main handler for transformer endpoints
  * Coordinates the entire request processing flow: validate provider, handle request transformers,
  * send request, handle response transformers, format response
@@ -50,6 +87,17 @@ async function handleTransformerEndpoint(
       404,
       "provider_not_found"
     );
+  }
+
+  // If the default model is already rate-limited, skip directly to fallback
+  const requestModel = body?.model;
+  if (requestModel && isRateLimited(providerName, requestModel)) {
+    req.log.info(`Model ${providerName},${requestModel} is rate-limited, skipping to fallback`);
+    const fallbackResult = await handleFallback(req, reply, fastify, transformer, null);
+    if (fallbackResult) {
+      return fallbackResult;
+    }
+    // No fallback available, try anyway (maybe the limit has lifted)
   }
 
   try {
@@ -323,13 +371,21 @@ async function handleFallback(
 
   // Try each fallback model in sequence
   for (const fallbackModel of fallbackList) {
+    const [fallbackProvider, ...fallbackModelName] = fallbackModel.split(',');
+    const modelName = fallbackModelName.join(',');
+
+    // Skip models that are known to be rate-limited
+    if (isRateLimited(fallbackProvider, modelName)) {
+      req.log.info(`Skipping rate-limited fallback: ${fallbackModel}`);
+      continue;
+    }
+
     try {
       req.log.info(`Trying fallback model: ${fallbackModel}`);
 
       // Update request with fallback model
       const newBody = { ...(req.body as any) };
-      const [fallbackProvider, ...fallbackModelName] = fallbackModel.split(',');
-      newBody.model = fallbackModelName.join(',');
+      newBody.model = modelName;
 
       // Create new request object with updated provider and body
       const newReq = {
@@ -384,7 +440,14 @@ async function handleFallback(
         newReq as FastifyRequest
       );
     } catch (fallbackError: any) {
-      req.log.warn(`Fallback model ${fallbackModel} failed: ${fallbackError.message}`);
+      // Cache rate limit for this fallback model too
+      if (fallbackError.code === 'provider_response_error' && fallbackError.statusCode === 429) {
+        const resetAt = parseRateLimitReset(fallbackError.message);
+        markRateLimited(fallbackProvider, modelName, resetAt);
+        req.log.warn(`Fallback ${fallbackModel} rate-limited, cached`);
+      } else {
+        req.log.warn(`Fallback model ${fallbackModel} failed: ${fallbackError.message}`);
+      }
       continue;
     }
   }
@@ -568,6 +631,25 @@ async function sendRequestToProvider(
     fastify.log.error(
       `[provider_response_error] Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
     );
+
+    // On 429, capture rate limit reset from response headers
+    if (response.status === 429) {
+      const resetHeader = response.headers.get('x-ratelimit-reset')
+        || response.headers.get('X-RateLimit-Reset');
+      let resetAt: number | undefined;
+      if (resetHeader) {
+        const val = parseInt(resetHeader, 10);
+        resetAt = val < 1e12 ? val * 1000 : val;
+      }
+      if (!resetAt) {
+        resetAt = parseRateLimitReset(errorText);
+      }
+      markRateLimited(provider.name, requestBody.model, resetAt);
+      fastify.log.warn(
+        `Rate limited: ${provider.name},${requestBody.model}, cached until ${new Date(rateLimitCache.get(`${provider.name},${requestBody.model}`)!).toISOString()}`
+      );
+    }
+
     throw createApiError(
       `Error from provider(${provider.name},${requestBody.model}: ${response.status}): ${errorText}`,
       response.status,
