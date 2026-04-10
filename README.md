@@ -503,6 +503,35 @@ For routing within subagents, you must specify a particular provider and model b
 Please help me analyze this code snippet for potential optimizations...
 ```
 
+#### Fallback & Rate Limit Cache
+
+When a provider returns an error, CCR can automatically try fallback models. Add a `fallback` object to your `config.json`:
+
+```json
+{
+  "Router": {
+    "default": "or,nvidia/nemotron-3-super-120b-a12b:free"
+  },
+  "fallback": {
+    "default": [
+      "or,qwen/qwen3-coder:free",
+      "or,meta-llama/llama-3.3-70b-instruct:free",
+      "or,google/gemma-4-26b-a4b-it:free"
+    ],
+    "background": [
+      "or,qwen/qwen3-coder:free",
+      "or,meta-llama/llama-3.3-70b-instruct:free"
+    ]
+  }
+}
+```
+
+Each key in `fallback` corresponds to a scenario type (`default`, `background`, `think`, etc.). When the primary model fails, CCR tries each fallback in order until one succeeds.
+
+**Rate Limit Cache**: When a model returns HTTP 429 (rate limited), CCR caches the rate limit reset time (from the `X-RateLimit-Reset` header, or end-of-day UTC as fallback). Subsequent requests automatically skip cached models and go directly to the next available fallback, avoiding wasted round trips.
+
+> **Note on OpenRouter free models**: OpenRouter's free tier rate limit (50 requests/day) is **per-account**, not per-model. Using multiple `:free` models as fallbacks won't multiply your quota — they all share the same 50 requests/day pool. Adding $10 in credits unlocks 1,000 free-model requests/day.
+
 ## Status Line (Beta)
 To better monitor the status of claude-code-router at runtime, version v1.0.40 includes a built-in statusline tool, which you can enable in the UI.
 ![statusline-config.png](/blog/images/statusline-config.png)
